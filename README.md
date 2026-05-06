@@ -47,6 +47,20 @@ This is **best-effort**. On the following systems, in-place overwrite does **not
 
 For real assurance on these, the only reliable option is full-disk encryption from day one (so "shredding" reduces to forgetting the key) or physical destruction.
 
+## Progress output
+
+Each path gets a status line printed to stderr:
+
+```
+/some/path/file.txt      [=======>----------------------]  512.0KB/1.0MB  50%
+/some/path/file.txt      [=============================>]  done
+/some/path/file.txt      [------------------------------]  FAIL: <reason>
+```
+
+- `=` — bytes overwritten so far; `>` marks the current position
+- `-` — remaining work
+- When stderr is not a terminal, one line per job is printed after all jobs finish
+
 ## Files
 
 - `main.go` — entry point, traversal, chunk overwrite, scrub-rename.
