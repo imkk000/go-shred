@@ -22,17 +22,6 @@ const (
 
 var sem chan struct{}
 
-func init() {
-	n := runtime.NumCPU()
-	if n < 2 {
-		n = 2
-	}
-	if n > 8 {
-		n = 8
-	}
-	sem = make(chan struct{}, n)
-}
-
 func randomName(n int) (string, error) {
 	b := make([]byte, n)
 	if _, err := rand.Read(b); err != nil {
@@ -234,15 +223,16 @@ func main() {
 		fmt.Fprintf(os.Stderr, "usage: %s <path> [path...]\n", os.Args[0])
 		os.Exit(2)
 	}
-
-	fmt.Fprintln(os.Stderr, "note: on APFS/btrfs/ZFS or SSDs, original blocks may persist (best-effort shred)")
-
+	n := max(2, min(8, runtime.NumCPU()))
+	sem = make(chan struct{}, n)
 	var wg sync.WaitGroup
 	var mu sync.Mutex
-	exit := 0
+	var exit int
 	for _, p := range os.Args[1:] {
+		wg.Go(func() {
+		})
 		wg.Add(1)
-		go func(p string) {
+		func(p string) {
 			defer wg.Done()
 			if err := shred(p); err != nil {
 				mu.Lock()
@@ -251,7 +241,7 @@ func main() {
 				mu.Unlock()
 				return
 			}
-			fmt.Printf("%s: done\n", p)
+			fmt.Printf("[%s] done\n", p)
 		}(p)
 	}
 	wg.Wait()
