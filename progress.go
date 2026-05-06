@@ -152,15 +152,15 @@ func formatLine(j *Job) string {
 	var bar, status string
 	switch state {
 	case jobDone:
-		bar = "\x1b[32m" + strings.Repeat("█", barW) + "\x1b[0m"
-		status = "\x1b[32m✓ done\x1b[0m"
+		bar = strings.Repeat("=", barW-1) + ">"
+		status = "done"
 	case jobFail:
-		bar = "\x1b[31m" + strings.Repeat("░", barW) + "\x1b[0m"
+		bar = strings.Repeat("-", barW)
 		msg := ""
 		if mp := j.msg.Load(); mp != nil {
 			msg = *mp
 		}
-		status = "\x1b[31m✗ " + truncLabel(msg, 40) + "\x1b[0m"
+		status = "FAIL: " + truncLabel(msg, 40)
 	default:
 		pct := 0.0
 		if total > 0 {
@@ -170,11 +170,15 @@ func formatLine(j *Job) string {
 			}
 		}
 		filled := int(float64(barW) * pct)
-		bar = strings.Repeat("█", filled) + strings.Repeat("░", barW-filled)
+		if filled > 0 && filled < barW {
+			bar = strings.Repeat("=", filled-1) + ">" + strings.Repeat("-", barW-filled)
+		} else {
+			bar = strings.Repeat("=", filled) + strings.Repeat("-", barW-filled)
+		}
 		if total > 0 {
 			status = fmt.Sprintf("%s/%s %3.0f%%", humanBytes(cur), humanBytes(total), pct*100)
 		} else {
-			status = "scanning…"
+			status = "scanning..."
 		}
 	}
 	return fmt.Sprintf("%-*s [%s] %s", labelW, label, bar, status)
