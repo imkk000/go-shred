@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	mrand "math/rand/v2"
 	"os"
 	"path/filepath"
@@ -79,13 +80,22 @@ func shredChunk(f *os.File, offset int64, size int) error {
 	return f.Sync()
 }
 
-func shredFile(path string) error {
-	chunk := defaultChunk
-	renames := defaultRenames
-	if chunk <= 0 {
-		return errors.New("chunk size must be > 0")
-	}
+func openRW(path string) (*os.File, error) {
 	f, err := os.OpenFile(path, os.O_RDWR, 0)
+	if err == nil {
+		return f, nil
+	}
+	if !errors.Is(err, fs.ErrPermission) {
+		return nil, err
+	}
+	if chErr := os.Chmod(path, 0o600); chErr != nil {
+		return nil, err
+	}
+	return os.OpenFile(path, os.O_RDWR, 0)
+}
+
+func shredFile(path string, onProgress func(int64)) error {
+	f, err := openRW(path)
 	if err != nil {
 		return err
 	}
@@ -97,17 +107,18 @@ func shredFile(path string) error {
 	}
 	size := info.Size()
 	if size > 0 {
-		rounds := (size + int64(chunk) - 1) / int64(chunk)
-		for i := range rounds {
-			offset := i * int64(chunk)
-			n := int64(chunk)
+		chunk := int64(defaultChunk)
+		rounds := (size + chunk - 1) / chunk
+		for i := int64(0); i < rounds; i++ {
+			offset := i * chunk
+			n := chunk
 			if offset+n > size {
 				n = size - offset
 			}
 			if err := shredChunk(f, offset, int(n)); err != nil {
 				return err
 			}
-			fmt.Printf("[%s] round %d/%d offset=%d len=%d\n", path, i+1, rounds, offset, n)
+			onProgress(n)
 		}
 	}
 
@@ -121,27 +132,87 @@ func shredFile(path string) error {
 		return err
 	}
 
-	final, err := scrubName(path, renames)
+	final, err := scrubName(path, defaultRenames)
 	if err != nil {
 		return err
-	}
-	if final != path {
-		fmt.Printf("[%s] renamed -> %s\n", path, filepath.Base(final))
 	}
 	return os.Remove(final)
 }
 
-func shredDir(path string) error {
-	entries, err := os.ReadDir(path)
-	if err != nil {
-		return err
+const (
+	itemFile = iota
+	itemDir
+	itemSymlink
+	itemOther
+)
+
+type item struct {
+	path string
+	kind int
+	size int64
+}
+
+func walk(root string) ([]item, int64, error) {
+	var items []item
+	var total int64
+	var visit func(string) error
+	visit = func(p string) error {
+		info, err := os.Lstat(p)
+		if err != nil {
+			return err
+		}
+		m := info.Mode()
+		switch {
+		case m&os.ModeSymlink != 0:
+			items = append(items, item{p, itemSymlink, 0})
+		case m.IsDir():
+			entries, err := os.ReadDir(p)
+			if err != nil {
+				return err
+			}
+			for _, e := range entries {
+				if err := visit(filepath.Join(p, e.Name())); err != nil {
+					return err
+				}
+			}
+			items = append(items, item{p, itemDir, 0})
+		case m.IsRegular():
+			items = append(items, item{p, itemFile, info.Size()})
+			total += info.Size()
+		default:
+			items = append(items, item{p, itemOther, 0})
+		}
+		return nil
 	}
+	if err := visit(root); err != nil {
+		return nil, 0, err
+	}
+	return items, total, nil
+}
+
+func processOne(root string, prog *Progress) {
+	if _, err := os.Lstat(root); err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			return
+		}
+		j := prog.Add(root)
+		j.Fail(err)
+		return
+	}
+
+	job := prog.Add(root)
+	items, total, err := walk(root)
+	if err != nil {
+		job.Fail(err)
+		return
+	}
+	job.SetTotal(total)
 
 	var wg sync.WaitGroup
 	var mu sync.Mutex
 	var firstErr error
 	record := func(err error) {
-		if err == nil {
+		if err == nil || errors.Is(err, fs.ErrNotExist) {
 			return
 		}
 		mu.Lock()
@@ -151,99 +222,116 @@ func shredDir(path string) error {
 		mu.Unlock()
 	}
 
-	for _, e := range entries {
-		child := filepath.Join(path, e.Name())
-		info, err := os.Lstat(child)
-		if err != nil {
-			record(err)
+	for _, it := range items {
+		if it.kind != itemFile {
 			continue
 		}
-		switch {
-		case info.Mode()&os.ModeSymlink != 0:
-			if err := os.Remove(child); err != nil {
-				record(err)
-			} else {
-				fmt.Printf("%s: symlink removed\n", child)
+		wg.Add(1)
+		go func(it item) {
+			defer wg.Done()
+			sem <- struct{}{}
+			defer func() { <-sem }()
+			if err := shredFile(it.path, job.Add); err != nil {
+				record(fmt.Errorf("%s: %w", filepath.Base(it.path), err))
 			}
-		case info.IsDir():
-			wg.Add(1)
-			go func(p string) {
-				defer wg.Done()
-				record(shredDir(p))
-			}(child)
-		default:
-			wg.Add(1)
-			go func(p string) {
-				defer wg.Done()
-				sem <- struct{}{}
-				defer func() { <-sem }()
-				if err := shredFile(p); err != nil {
-					record(err)
-					return
-				}
-				fmt.Printf("%s: shredded\n", p)
-			}(child)
-		}
+		}(it)
 	}
 	wg.Wait()
+
 	if firstErr != nil {
-		return firstErr
+		job.Fail(firstErr)
+		return
 	}
 
-	final, err := scrubName(path, defaultRenames)
-	if err != nil {
-		return err
+	for _, it := range items {
+		switch it.kind {
+		case itemSymlink, itemOther:
+			if err := os.Remove(it.path); err != nil && !errors.Is(err, fs.ErrNotExist) {
+				job.Fail(err)
+				return
+			}
+		case itemDir:
+			final, err := scrubName(it.path, defaultRenames)
+			if err != nil {
+				job.Fail(err)
+				return
+			}
+			if err := os.Remove(final); err != nil && !errors.Is(err, fs.ErrNotExist) {
+				job.Fail(err)
+				return
+			}
+		}
 	}
-	if final != path {
-		fmt.Printf("renamed dir -> %s\n", filepath.Base(final))
-	}
-	return os.Remove(final)
+	job.Done()
 }
 
-func shred(path string) error {
-	info, err := os.Lstat(path)
-	if err != nil {
-		return err
+func hasGlob(s string) bool {
+	for i := 0; i < len(s); i++ {
+		switch s[i] {
+		case '*', '?', '[':
+			return true
+		case '\\':
+			i++
+		}
 	}
-	mode := info.Mode()
-	switch {
-	case mode&os.ModeSymlink != 0:
-		return os.Remove(path)
-	case mode.IsDir():
-		return shredDir(path)
-	case mode.IsRegular():
-		return shredFile(path)
-	default:
-		return fmt.Errorf("refusing non-regular file (%s)", mode)
+	return false
+}
+
+func expandArgs(args []string) []string {
+	var out []string
+	for _, a := range args {
+		if hasGlob(a) {
+			matches, _ := filepath.Glob(a)
+			out = append(out, matches...)
+			continue
+		}
+		out = append(out, a)
 	}
+	return out
 }
 
 func main() {
-	if len(os.Args) < 2 {
-		fmt.Fprintf(os.Stderr, "usage: %s <path> [path...]\n", os.Args[0])
+	var raw []string
+	endOfFlags := false
+	for _, a := range os.Args[1:] {
+		if !endOfFlags {
+			if a == "--" {
+				endOfFlags = true
+				continue
+			}
+			if len(a) > 1 && a[0] == '-' {
+				continue
+			}
+		}
+		raw = append(raw, a)
+	}
+	if len(raw) == 0 {
+		fmt.Fprintf(os.Stderr, "usage: %s [path|glob]...\n", os.Args[0])
 		os.Exit(2)
 	}
+	paths := expandArgs(raw)
+	if len(paths) == 0 {
+		os.Exit(0)
+	}
+
 	n := max(2, min(8, runtime.NumCPU()))
 	sem = make(chan struct{}, n)
+
+	prog := NewProgress(os.Stderr)
+	prog.Start()
+
 	var wg sync.WaitGroup
-	var mu sync.Mutex
-	var exit int
-	for _, p := range os.Args[1:] {
-		wg.Go(func() {
-		})
+	for _, p := range paths {
 		wg.Add(1)
-		func(p string) {
+		go func(p string) {
 			defer wg.Done()
-			if err := shred(p); err != nil {
-				mu.Lock()
-				fmt.Fprintf(os.Stderr, "%s: %v\n", p, err)
-				exit = 1
-				mu.Unlock()
-				return
-			}
-			fmt.Printf("[%s] done\n", p)
+			processOne(p, prog)
 		}(p)
 	}
 	wg.Wait()
-	os.Exit(exit)
+	prog.Stop()
+
+	if prog.HasFailures() {
+		os.Exit(1)
+	}
 }
