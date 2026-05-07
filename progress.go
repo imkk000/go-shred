@@ -35,6 +35,13 @@ func (j *Job) Done() {
 	}
 }
 
+func (j *Job) DoneAs(msg string) {
+	s := msg
+	j.msg.Store(&s)
+	j.cur.Store(j.total.Load())
+	j.state.Store(jobDone)
+}
+
 func (j *Job) Fail(err error) {
 	s := err.Error()
 	j.msg.Store(&s)
@@ -154,6 +161,9 @@ func formatLine(j *Job) string {
 	case jobDone:
 		bar = strings.Repeat("=", barW-1) + ">"
 		status = "done"
+		if mp := j.msg.Load(); mp != nil {
+			status = *mp
+		}
 	case jobFail:
 		bar = strings.Repeat("-", barW)
 		msg := ""

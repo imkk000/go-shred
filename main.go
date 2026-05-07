@@ -13,6 +13,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"sync"
 )
 
@@ -190,7 +191,7 @@ func walk(root string) ([]item, int64, error) {
 	return items, total, nil
 }
 
-func processOne(root string, prog *Progress) {
+func processOne(root string, prog *Progress, force bool) {
 	if _, err := os.Lstat(root); err != nil {
 		if errors.Is(err, fs.ErrNotExist) {
 			return
@@ -201,6 +202,16 @@ func processOne(root string, prog *Progress) {
 	}
 
 	job := prog.Add(root)
+
+	if !force {
+		if err := moveToTrash(root); err != nil {
+			job.Fail(err)
+			return
+		}
+		job.DoneAs("trashed")
+		return
+	}
+
 	items, total, err := walk(root)
 	if err != nil {
 		job.Fail(err)
@@ -292,6 +303,8 @@ func expandArgs(args []string) []string {
 
 func main() {
 	var raw []string
+	force := false
+	emptyTrash := false
 	endOfFlags := false
 	for _, a := range os.Args[1:] {
 		if !endOfFlags {
@@ -299,17 +312,48 @@ func main() {
 				endOfFlags = true
 				continue
 			}
+			if strings.HasPrefix(a, "--") {
+				switch a {
+				case "--force":
+					force = true
+				case "--empty-trash":
+					emptyTrash = true
+				}
+				continue
+			}
 			if len(a) > 1 && a[0] == '-' {
+				if strings.ContainsRune(a[1:], 'f') {
+					force = true
+				}
 				continue
 			}
 		}
 		raw = append(raw, a)
 	}
-	if len(raw) == 0 {
-		fmt.Fprintf(os.Stderr, "usage: %s [path|glob]...\n", os.Args[0])
-		os.Exit(2)
+
+	var paths []string
+	if emptyTrash {
+		force = true
+		filesDir, err := trashFilesDir()
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "%v\n", err)
+			os.Exit(1)
+		}
+		entries, err := os.ReadDir(filesDir)
+		if err != nil && !errors.Is(err, fs.ErrNotExist) {
+			fmt.Fprintf(os.Stderr, "%v\n", err)
+			os.Exit(1)
+		}
+		for _, e := range entries {
+			paths = append(paths, filepath.Join(filesDir, e.Name()))
+		}
+	} else {
+		if len(raw) == 0 {
+			fmt.Fprintf(os.Stderr, "usage: %s [-f] [--empty-trash] [path|glob]...\n", os.Args[0])
+			os.Exit(2)
+		}
+		paths = expandArgs(raw)
 	}
-	paths := expandArgs(raw)
 	if len(paths) == 0 {
 		os.Exit(0)
 	}
@@ -325,11 +369,12 @@ func main() {
 		wg.Add(1)
 		go func(p string) {
 			defer wg.Done()
-			processOne(p, prog)
+			processOne(p, prog, force)
 		}(p)
 	}
 	wg.Wait()
 	prog.Stop()
+	cleanupOrphanInfo()
 
 	if prog.HasFailures() {
 		os.Exit(1)
