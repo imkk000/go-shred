@@ -192,6 +192,7 @@ func walk(root string) ([]item, int64, error) {
 }
 
 func processOne(root string, prog *Progress, force bool) {
+	root = filepath.Clean(root)
 	if _, err := os.Lstat(root); err != nil {
 		if errors.Is(err, fs.ErrNotExist) {
 			return
